@@ -1,0 +1,452 @@
+#!/usr/bin/env python
+
+import imapbulkdecrypt
+
+import logging
+import threading
+import argparse
+
+
+# Helper Functions
+def local_message(imap, mbox, gpg, mode, uid, msg, result):
+    # Decrypt
+    if mode == "decrypt":
+        try:
+            msg = imapbulkdecrypt.translate(gpg, msg)
+        except imapbulkdecrypt.NotEncrypted:
+            logging.warning(
+                "Skip message {} in {}: {}".format(uid, imap.path, "Not encrypted.")
+            )
+            return
+        except imapbulkdecrypt.TranslateException as e:
+            logging.error(
+                "Failed to decrypt message {} in {}: {}".format(uid, imap.path, e)
+            )
+            return
+
+    try:
+        mbox.add_msg(msg)
+    except imapbulkdecrypt.MailboxException as e:
+        logging.error("Failed to store message {} in {}: {}".format(uid, imap.path, e))
+    else:
+        # Increment external counter
+        result[0] = 1
+
+
+def remote_message(imap, gpg, uid, msg, flags, result):
+    # Decrypt
+    try:
+        msg = imapbulkdecrypt.translate(gpg, msg)
+    except imapbulkdecrypt.NotEncrypted:
+        logging.warning(
+            "Skip message {} in {}: {}".format(uid, imap.path, "Not encrypted.")
+        )
+        return
+    except imapbulkdecrypt.TranslateException as e:
+        logging.error(
+            "Failed to decrypt message {} in {}: {}".format(uid, imap.path, e)
+        )
+        return
+
+    # Add decrypted message
+    try:
+        imap.add_msg(msg, flags)
+    except imapbulkdecrypt.ImapException:
+        logging.error(
+            "Failed to upload decrypted message {} in {}.".format(uid, imap.path)
+        )
+        return
+    else:
+        # Increment external counter
+        result[0] = 1
+
+    # Delete encrypted message
+    try:
+        imap.rm_msg(uid)
+    except imapbulkdecrypt.ImapException:
+        logging.error(
+            "Failed to delete encrypted message {} in {}.".format(uid, imap.path)
+        )
+
+
+def local_messages_loop(imap, gpg, locs, dirname):
+    counter = 0
+
+    with imapbulkdecrypt.Mailbox(dirname) as mbox:
+        for loc in locs:
+            path = loc["path"]
+            uids = loc["mime"] + loc["inline"]
+            uids.sort(reverse=True)
+
+            logging.debug("Download from {}...".format(path))
+
+            # Make local path and switch to it
+            mbox.mkdir(path)
+            imap.cd(path)
+
+            # Download all messages for this path
+            for uid in uids:
+                result = [0]
+                try:
+                    msg = imap.get_msg(uid)[0]
+
+                    # Span thread to avoid interruption during processing of a
+                    # message
+                    thread = threading.Thread(
+                        target=local_message,
+                        args=(imap, mbox, gpg, mode, uid, msg, result),
+                    )
+                    thread.start()
+                    thread.join()
+
+                except KeyboardInterrupt:
+                    if thread and thread.is_alive():
+                        thread.join()
+
+                    logging.debug("Abort.")
+                    return counter
+
+                finally:
+                    counter += result[0]
+
+    return counter
+
+
+def remote_messages_loop(imap, gpg, locs):
+    counter = 0
+
+    for loc in locs:
+        path = loc["path"]
+        uids = loc["mime"] + loc["inline"]
+        uids.sort(reverse=True)
+
+        logging.debug("{} {}...".format(action, path))
+
+        # Select path
+        imap.cd(path)
+
+        # Download all messages for this path
+        for uid in uids:
+            result = [0]
+            try:
+                msg, flags = imap.get_msg(uid)
+
+                # Print message headers
+                if args.remote == "print":
+                    print("From:    {}".format(msg.get("From")))
+                    print("To:      {}".format(msg.get("To")))
+                    print("Date:    {}".format(msg.get("Date")))
+                    print("Subject: {}".format(msg.get("Subject")))
+                    continue
+
+                # Span thread to avoid interruption during processing of a
+                # message
+                thread = threading.Thread(
+                    target=remote_message, args=(imap, gpg, uid, msg, flags, result)
+                )
+                thread.start()
+                thread.join()
+
+            except KeyboardInterrupt:
+                if thread and thread.is_alive():
+                    thread.join()
+
+                logging.debug("Abort.")
+                return counter
+
+            finally:
+                counter += result[0]
+
+    return counter
+
+
+# CLI Arguments
+parser = argparse.ArgumentParser(
+    description="Bulk-decrypt GPG encrypted messages via IMAP."
+)
+
+parser.add_argument(
+    "-c", "--config", default=None, type=str, help="IMAP server configuration file"
+)
+parser.add_argument(
+    "--server", type=str, help="Server name to choose from configuration file"
+)
+parser.add_argument(
+    "-p", "--path", default=None, type=str, help="Path on IMAP server to operate on"
+)
+parser.add_argument(
+    "-u", "--uid", type=int, help="Act on single message for given ID in path"
+)
+
+parser.add_argument(
+    "-s",
+    "--search",
+    action="store_true",
+    help="Search for encrypted messages in path and print IDs",
+)
+parser.add_argument(
+    "-r",
+    "--remote",
+    type=str,
+    help='Remote mode: "decrypt" to overwrite remote messages with decrypted message, '
+    + '"print" to print header of found messages',
+)
+parser.add_argument(
+    "-l",
+    "--local",
+    type=str,
+    nargs=2,
+    help='Local mode: "decrypt" to store remote messages decrypted, "backup" to store '
+    + "remote messages as they are, followed by path to store Maildir",
+)
+
+parser.add_argument(
+    "-f",
+    "--force",
+    action="store_true",
+    help="Overwrite messages on IMAP server without confirmation",
+)
+parser.add_argument(
+    "-R",
+    "--recursive",
+    action="store_true",
+    help="Operate not only on path but also its subitems",
+)
+parser.add_argument(
+    "-m",
+    "--mark-only",
+    action="store_true",
+    help="Mark messages only as to be deleted instead of deleting them",
+)
+parser.add_argument(
+    "-d",
+    "--logging-level",
+    type=str,
+    default="INFO",
+    help="Set output logging level (Default: INFO)",
+)
+
+args = parser.parse_args()
+
+
+# Set log level
+log_levels = {
+    "CRITICAL": logging.CRITICAL,
+    "ERROR": logging.ERROR,
+    "WARNING": logging.WARNING,
+    "INFO": logging.INFO,
+    "DEBUG": logging.DEBUG,
+    "NOTSET": logging.NOTSET,
+}
+log_level = args.logging_level.upper()
+
+if log_level not in log_levels:
+    print("Invalid logging level.")
+    exit(-1)
+
+logging.basicConfig(
+    format="%(levelname)s: [ibd] %(message)s", level=log_levels[log_level]
+)
+
+
+# Get IMAP server config
+config = {}
+if args.config:
+    import configparser
+
+    # Load from file
+    logging.debug("Load configuration from {}".format(args.config))
+
+    config_file = configparser.ConfigParser()
+    config_file.read(args.config)
+
+    if args.server:
+        # Select server by name
+        section = args.server
+    else:
+        # Select first server
+        section = config_file.sections()[0]
+
+    if section in config_file.sections():
+        for item in config_file.items(section):
+            config[item[0]] = item[1]
+    else:
+        logging.error("Server does not exist in given configuration.")
+        exit(-1)
+
+elif __name__ == "__main__":
+    # Ask user
+    from getpass import getpass
+
+    config["host"] = input("IMAP Server: ")
+    config["user"] = input("IMAP User: ")
+    config["password"] = getpass("IMAP Password: ")
+
+else:
+    logging.error("No server configuration provided.")
+    exit(-1)
+
+
+# Test connection to IMAP server
+try:
+    imap = imapbulkdecrypt.Imap(**config)
+    imap.open()
+except imapbulkdecrypt.ImapException:
+    logging.error("Unable to connect to server.")
+    exit(-1)
+else:
+    logging.debug(
+        "Successfully connected to {} as {}.".format(config["host"], config["user"])
+    )
+
+
+# Verify path on IMAP server
+if args.path:
+    try:
+        imap.path = args.path
+    except imapbulkdecrypt.ImapException:
+        logging.error("Unable to change to given path on IMAP server.")
+        exit(-1)
+    else:
+        logging.debug("Changed path to {}".format(imap.path))
+else:
+    logging.error("No path for IMAP server specified.")
+
+    # Print available paths (recursively)
+    if __name__ == "__main__":
+        print("Please select your path (including the quotes):")
+        for d in imap.ls():
+            print(d)
+
+    exit(-1)
+
+
+# Search messages in path
+if args.uid:
+    uid = str(args.uid)
+
+    # Search only current path (not recursively)
+    locs = imap.search(False)
+
+    if uid in locs[0]["mime"]:
+        locs[0]["mime"] = [uid]
+        locs[0]["inline"] = []
+    elif uid in locs[0]["inline"]:
+        locs[0]["mime"] = []
+        locs[0]["inline"] = [uid]
+    else:
+        logging.error("Unable to find message for given ID in current path.")
+        exit(-1)
+
+    # Print search result
+    if args.search:
+        logging.info(
+            "Found encrypted message for given ID {} in {}.".format(uid, imap.path)
+        )
+
+else:
+    try:
+        locs = imap.search(args.recursive)
+    except KeyboardInterrupt:
+        logging.debug("Abort.")
+        exit(0)
+
+    # Print search results
+    if locs:
+        if args.search:
+            # Print all message IDs
+            if __name__ == "__main__":
+                print(
+                    "Found the following encrypted messages on {}.".format(
+                        config["host"]
+                    )
+                )
+                for loc in locs:
+                    print("  {}".format(loc["path"]))
+                    if loc["mime"]:
+                        print("    mime:   {}".format(", ".join(loc["mime"])))
+                    if loc["inline"]:
+                        print("    inline: {}".format(", ".join(loc["inline"])))
+            else:
+                count = 0
+                for loc in locs:
+                    if loc["mime"]:
+                        count += len(loc["mime"])
+                    if loc["inline"]:
+                        count += len(loc["inline"])
+
+                logging.info(
+                    "Found {} encrypted messages in {}.".format(count, imap.path)
+                )
+    else:
+        logging.error("Found no encrypted messages in current path.")
+        exit(-1)
+
+
+# Execute local command
+if args.local:
+    mode = args.local[0]
+    dirname = args.local[1]
+
+    if mode == "decrypt":
+        gpg = imapbulkdecrypt.get_gpg()
+    elif mode == "backup":
+        pass
+    else:
+        logging.error('Invalid option for first value of "local" argument.')
+        exit(-1)
+
+    # Download all messages
+    try:
+        counter = local_messages_loop(imap, gpg, locs, dirname)
+    except KeyboardInterrupt:
+        logging.debug("Abort.")
+    else:
+        logging.debug("Downloaded {} messages.".format(counter))
+
+
+# Execute remote command
+if args.remote:
+    if args.remote == "decrypt":
+        gpg = imapbulkdecrypt.get_gpg()
+
+        if args.force:
+            confirm = True
+
+        elif __name__ == "__main__":
+            # Ask for user confirmation
+            confirm = input(
+                "Are you sure you want to overwrite all encrypted messages in the "
+                + "given path on this IMAP server with their decrypted equivalent? "
+                + "Please be aware that you might loose or corrupt your emails and "
+                + "their content if you choose to continue. Y/n: "
+            )
+            if confirm != "Y":
+                exit(1)
+
+        else:
+            logging.error("Remote modification not confirmed. Abort.")
+            exit(-1)
+
+        action = "Translate"
+
+    elif args.remote == "print":
+        gpg = None
+        action = "Print"
+
+    else:
+        logging.error('Invalid option for argument "remote".')
+        exit(-1)
+
+    # Translate all messages
+    counter = remote_messages_loop(imap, gpg, locs)
+
+    if args.remote == "decrypt":
+        logging.debug("Translated {} messages.".format(counter))
+
+    # Delete marked messages
+    if not args.mark_only:
+        imap.expunge()
+
+# Close connection
+imap.close()

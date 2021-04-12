@@ -1,0 +1,8 @@
+### Python ###
+.venv/
+build/
+*.egg-info
+*.ini
+
+### macOS ###
+.DS_Store
